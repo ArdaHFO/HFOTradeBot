@@ -8,7 +8,7 @@ let lastRefPrice = null;
 let lastSignalTime = 0;
 const priceHistory = [];
 
-const cooldownMS = 1 * 60 * 1000; // 30 dakika
+const cooldownMS = 1 * 60 * 1000; // 1 dakika
 const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
 
 ws.on('open', () => {
@@ -41,9 +41,10 @@ ws.on('message', (data) => {
   const now = Date.now();
 
   if (!currentEMA10 || !currentEMA21 || !currentRSI) return;
-  if (now - lastSignalTime < cooldownMS) return;
-
   const emaDiff = Math.abs(currentEMA10 - currentEMA21);
+
+  // Sadece cooldown süresi dolduysa sinyal gönder
+  let signalSent = false;
 
   // AL sinyali
   if (
@@ -52,25 +53,35 @@ ws.on('message', (data) => {
     price > lastRefPrice * 1.03 &&
     emaDiff > 10
   ) {
-    sendTelegramMessage(
-      `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
-    );
-    lastRefPrice = price;
-    lastSignalTime = now;
+    if (now - lastSignalTime >= cooldownMS) {
+      sendTelegramMessage(
+        `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
+      );
+      lastRefPrice = price;
+      lastSignalTime = now;
+      signalSent = true;
+    }
   }
 
   // SAT sinyali
   if (
     (currentEMA10 < currentEMA21 ||
-     currentRSI > 75 ||
-     price < lastRefPrice * 0.95) &&
+      currentRSI > 75 ||
+      price < lastRefPrice * 0.95) &&
     emaDiff > 10
   ) {
-    sendTelegramMessage(
-      `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
-    );
-    lastRefPrice = price;
-    lastSignalTime = now;
+    if (now - lastSignalTime >= cooldownMS) {
+      sendTelegramMessage(
+        `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
+      );
+      lastRefPrice = price;
+      lastSignalTime = now;
+      signalSent = true;
+    }
+  }
+
+  if (!signalSent) {
+    // console.log('Cooldown aktif veya sinyal koşulları sağlanmadı.');
   }
 
   console.log(
