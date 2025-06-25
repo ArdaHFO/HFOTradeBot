@@ -1,188 +1,310 @@
 const WebSocket = require('ws');
-const { EMA, RSI, ATR } = require('technicalindicators'); // ATR ekledik
+const { EMA, RSI, ATR } = require('technicalindicators');
 const { sendTelegramMessage } = require('./notify');
 require('dotenv').config();
+const axios = require('axios');
 
 // --- Yapılandırma Parametreleri ---
 const SYMBOL = 'btcusdt';
 const TIMEFRAME = '1m';
 const WS_URL = `wss://stream.binance.com:9443/ws/${SYMBOL}@kline_${TIMEFRAME}`;
+const REST_API_URL = `https://api.binance.com/api/v3/klines`;
 
-const EMA_SHORT_PERIOD = 10;
+const EMA_SHORT_PERIOD = 5;
 const EMA_LONG_PERIOD = 21;
 const RSI_PERIOD = 14;
-const ATR_PERIOD = 14; // Volatilite için ATR periyodu
 
-// Cooldown süresi: Kısa vadeli trader için sinyal yoğunluğu önemli,
-// ancak spam'ı engellemek için minimum bir süre gerekli.
-// 15 saniye uygun bir başlangıç noktası olabilir.
-const COOLDOWN_MS = 15 * 1000; // 15 saniye
+const ATR_PERIOD = 7;
 
-// Sinyal Fİltreleri ve Eşikleri
-const RSI_BUY_LOWER = 45; // Aşırı satılmış durumdan çıkış ve momentum başlangıcı
-const RSI_BUY_UPPER = 70; // Aşırı alım bölgesine girmeden önce
-const RSI_SELL_LOWER = 30; // Aşırı satılmış bölgesine girmeden önce
-const RSI_SELL_UPPER = 65; // Aşırı alım durumundan çıkış ve momentum kaybı
+const COOLDOWN_MS = 10 * 1000;
 
-// Fiyat değişimi için dinamik eşik (ATR tabanlı)
-// Bir önceki referans fiyata göre yüzdesel değişim yerine ATR kullanacağız.
-const PRICE_CHANGE_MULTIPLIER_BUY = 0.5; // Fiyat, önceki mum kapanışından 0.5 * ATR kadar artmalı
-const PRICE_CHANGE_MULTIPLIER_SELL = 0.5; // Fiyat, önceki mum kapanışından 0.5 * ATR kadar düşmeli
+const RSI_BUY_LOWER = 40;
+const RSI_BUY_UPPER = 75;
+const RSI_SELL_LOWER = 25;
+const RSI_SELL_UPPER = 80;
 
-// EMA Farkı için dinamik eşik (ATR tabanlı)
-// EMA'ların birbirinden ayrılma derecesi için volatiliteye duyarlı eşik
-const EMA_DIFF_MULTIPLIER = 0.05; // EMA farkı, ATR'nin %5'i kadar olmalı (trendin gücü için)
+const PRICE_CHANGE_MULTIPLIER_BUY = 0.5;
+const PRICE_CHANGE_MULTIPLIER_SELL = 0.5;
+
+const EMA_DIFF_MULTIPLIER = 0.05;
+
+const STOP_LOSS_PERCENTAGE = 0.007; // %0.7 zarar kes
+
+// --- Komisyon Parametreleri ---
+const COMMISSION_RATE = 0.001; // %0.1 Binance spot komisyon oranı (BNB ile ödeme yapılıyorsa 0.00075 yap)
+const MIN_PROFIT_TARGET_PERCENTAGE = 0.002; // %0.2 minimum kar hedefi (komisyonları karşılayıp üzerine küçük kar almak için)
+
+// --- Bakiye Takibi ---
+const INITIAL_CAPITAL = 20000; // Başlangıç sermayesi (TL cinsinden veya ana para biriminde)
+let currentCapital = INITIAL_CAPITAL; // Güncel sermaye
+let lastPositionAmount = 0; // Son alınan pozisyonun miktarı (AL işleminde harcanan TL/USDT miktarı)
 
 // --- Dahili Değişkenler ---
 let lastSignalTime = 0;
-let lastBuyPrice = null; // En son AL sinyali fiyatı
-let lastSellPrice = null; // En son SAT sinyali fiyatı
-let lastTradeType = null; // Son sinyalin tipi: 'BUY' veya 'SELL'
+let lastBuyPrice = null; // Kripto biriminin alış fiyatı (komisyonsuz)
+let positionCostBasis = null; // Kripto biriminin komisyonlar dahil toplam maliyeti
+let lastTradeType = null; // 'BUY' (long pozisyondayız) veya null (nakitteyiz / pozisyonda değiliz)
 
-const priceHistory = []; // Kapanış fiyatları
-const highHistory = [];   // Yüksek fiyatlar (ATR için)
-const lowHistory = [];    // Düşük fiyatlar (ATR için)
-const closeHistory = [];  // Kapanış fiyatları (ATR için)
+const priceHistory = [];
+const highHistory = [];
+const lowHistory = [];
+const closeHistory = [];
 
-// WebSocket Bağlantısı
-const ws = new WebSocket(WS_URL);
+const MIN_REQUIRED_HISTORY_LENGTH = Math.max(EMA_LONG_PERIOD, RSI_PERIOD, ATR_PERIOD) + 2;
 
-ws.on('open', () => {
-  console.log(`📡 Binance WebSocket bağlantısı kuruldu: ${SYMBOL}@${TIMEFRAME}`);
-});
+let ws;
 
-ws.on('message', (data) => {
-  const parsed = JSON.parse(data);
-  const candle = parsed.k;
+// --- "TUT" Mesajı Zamanlayıcısı ---
+const HOLD_MESSAGE_INTERVAL_MS = 1 * 60 * 1000; // 1 dakikada bir "TUT" mesajı (eğer sinyal yoksa)
+let lastTradeOrSignalTime = Date.now(); // En son işlem veya sinyal zamanı
 
-  // Sadece mum kapanışında işlem yap
-  if (!candle.x) return;
+async function fetchInitialKlineData() {
+    try {
+        console.log(`🚀 Geçmiş ${MIN_REQUIRED_HISTORY_LENGTH} adet ${TIMEFRAME} mum verisi çekiliyor...`);
+        const response = await axios.get(REST_API_URL, {
+            params: {
+                symbol: SYMBOL.toUpperCase(),
+                interval: TIMEFRAME,
+                limit: MIN_REQUIRED_HISTORY_LENGTH
+            }
+        });
 
-  const open = parseFloat(candle.o);
-  const high = parseFloat(candle.h);
-  const low = parseFloat(candle.l);
-  const close = parseFloat(candle.c); // Kapanış fiyatı
+        if (response.data && Array.isArray(response.data)) {
+            response.data.forEach(kline => {
+                highHistory.push(parseFloat(kline[2]));
+                lowHistory.push(parseFloat(kline[3]));
+                closeHistory.push(parseFloat(kline[4]));
+                priceHistory.push(parseFloat(kline[4]));
+            });
+            console.log(`✅ ${priceHistory.length} adet geçmiş mum verisi yüklendi.`);
+        } else {
+            console.error("❌ Geçmiş veri çekilemedi veya formatı hatalı.");
+        }
+    } catch (error) {
+        console.error("❌ Geçmiş mum verisi çekilirken hata oluştu:", error.message);
+        process.exit(1);
+    }
+}
 
-  if (isNaN(close) || isNaN(high) || isNaN(low) || isNaN(open)) return;
+function connectWebSocket() {
+  ws = new WebSocket(WS_URL);
 
-  // Geçmiş verileri güncelle
-  priceHistory.push(close);
-  highHistory.push(high);
-  lowHistory.push(low);
-  closeHistory.push(close);
+  ws.on('open', () => {
+    console.log(`📡 Binance WebSocket bağlantısı kuruldu: ${SYMBOL}@${TIMEFRAME}`);
+    // Sadece bot başlangıcında bir kez durum mesajı gönder
+    if (closeHistory.length > 0) {
+        sendTelegramMessage(`🤖 Bot başlatıldı! Anlık Fiyat: ${closeHistory.at(-1).toFixed(2)}\nBaşlangıç Sermayesi: ${INITIAL_CAPITAL.toFixed(2)} TL`);
+    } else {
+        sendTelegramMessage(`🤖 Bot başlatıldı! (Fiyat bekleniyor)\nBaşlangıç Sermayesi: ${INITIAL_CAPITAL.toFixed(2)} TL`);
+    }
+    lastTradeOrSignalTime = Date.now(); // Bot başladığında zamanı sıfırla
+  });
 
-  // Gerekli veri uzunluğunu koru (örneğin 100 mum yeterli, daha azı da olabilir)
-  const maxHistoryLength = Math.max(EMA_LONG_PERIOD, RSI_PERIOD, ATR_PERIOD) + 5; // Güvenli bir buffer
-  if (priceHistory.length > maxHistoryLength) {
-    priceHistory.shift();
-    highHistory.shift();
-    lowHistory.shift();
-    closeHistory.shift();
-  }
+  ws.on('message', (data) => {
+    const parsed = JSON.parse(data);
+    const candle = parsed.k;
 
-  // İlk veri toplama aşaması
-  if (priceHistory.length < maxHistoryLength) {
-    console.log(`⏳ Veri toplanıyor... (${priceHistory.length}/${maxHistoryLength})`);
-    return;
-  }
+    if (!candle.x) return; // Sadece mum kapanışında işlem yap
 
-  // Göstergeleri hesapla
-  const ema10 = EMA.calculate({ period: EMA_SHORT_PERIOD, values: priceHistory });
-  const ema21 = EMA.calculate({ period: EMA_LONG_PERIOD, values: priceHistory });
-  const rsi = RSI.calculate({ period: RSI_PERIOD, values: priceHistory });
-  const atr = ATR.calculate({ high: highHistory, low: lowHistory, close: closeHistory, period: ATR_PERIOD });
+    const open = parseFloat(candle.o);
+    const high = parseFloat(candle.h);
+    const low = parseFloat(candle.l);
+    const close = parseFloat(candle.c); // Güncel kapanış fiyatı
 
-  const currentEMA10 = ema10.at(-1);
-  const currentEMA21 = ema21.at(-1);
-  const currentRSI = rsi.at(-1);
-  const currentATR = atr.at(-1);
-  const previousClose = closeHistory.at(-2); // Bir önceki mumun kapanış fiyatı
+    if (isNaN(close) || isNaN(high) || isNaN(low) || isNaN(open)) return;
 
-  const now = Date.now();
+    if (priceHistory.length >= MIN_REQUIRED_HISTORY_LENGTH) {
+        priceHistory.shift();
+        highHistory.shift();
+        lowHistory.shift();
+        closeHistory.shift();
+    }
+    priceHistory.push(close);
+    highHistory.push(high);
+    lowHistory.push(low);
+    closeHistory.push(close);
 
-  // Hesaplamaların geçerli olduğundan emin ol
-  if (!currentEMA10 || !currentEMA21 || !currentRSI || !currentATR || !previousClose) {
-      console.log("⚠️ Gösterge hesaplamaları tamamlanmadı, bekliyor...");
-      return;
-  }
 
-  const emaDiff = Math.abs(currentEMA10 - currentEMA21);
-  const atrEmaDiffThreshold = currentATR * EMA_DIFF_MULTIPLIER; // EMA farkı eşiği ATR'ye göre dinamikleşti
+    if (priceHistory.length < MIN_REQUIRED_HISTORY_LENGTH) {
+        console.log(`⏳ Veri toplanıyor... (${priceHistory.length}/${MIN_REQUIRED_HISTORY_LENGTH})`);
+        return;
+    }
 
-  // Sinyal cooldown süresi kontrolü
-  if (now - lastSignalTime < COOLDOWN_MS) {
-      // console.log("⏳ Cooldown aktif.");
-      return;
-  }
+    const emaShort = EMA.calculate({ period: EMA_SHORT_PERIOD, values: priceHistory });
+    const emaLong = EMA.calculate({ period: EMA_LONG_PERIOD, values: priceHistory });
+    const rsi = RSI.calculate({ period: RSI_PERIOD, values: priceHistory });
+    const atr = ATR.calculate({ high: highHistory, low: lowHistory, close: closeHistory, period: ATR_PERIOD });
 
-  // --- AL Sinyali Mantığı ---
-  // Koşullar:
-  // 1. Kısa EMA uzun EMA'nın üzerinde (Bullish crossover)
-  // 2. RSI belirli bir aralıkta (momentum ve aşırı alım/satım olmaması)
-  // 3. Fiyat bir önceki mum kapanışına göre yeterince yükselmiş (volatiliteye göre teyit)
-  // 4. EMA'lar birbirinden yeterince açılmış (trendin gücü)
-  if (
-    currentEMA10 > currentEMA21 &&
-    currentRSI >= RSI_BUY_LOWER && currentRSI <= RSI_BUY_UPPER &&
-    close > previousClose + (currentATR * PRICE_CHANGE_MULTIPLIER_BUY) && // Önceki kapanışa göre ATR tabanlı artış
-    emaDiff > atrEmaDiffThreshold &&
-    lastTradeType !== 'BUY' // Bir AL sinyali zaten verilmişse tekrar vermemek (pozisyon açma mantığı için önemli)
-  ) {
-    sendTelegramMessage(
-      `📈 AL SİNYALİ!\nFiyat: ${close.toFixed(2)}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}\nATR: ${currentATR.toFixed(2)}`
+    const currentEMAShort = emaShort.at(-1);
+    const currentEMALong = emaLong.at(-1);
+    const currentRSI = rsi.at(-1);
+    const currentATR = atr.at(-1);
+    const previousClose = closeHistory.at(-2);
+
+    const now = Date.now();
+
+    if (!currentEMAShort || !currentEMALong || !currentRSI || !currentATR || previousClose === undefined) {
+        console.log("⚠️ Gösterge hesaplamaları tamamlanmadı veya yeterli geçmiş veri yok, bekliyor...");
+        return;
+    }
+
+    const emaDiff = Math.abs(currentEMAShort - currentEMALong);
+    const atrEmaDiffThreshold = currentATR * EMA_DIFF_MULTIPLIER;
+
+    // --- AL Sinyali Mantığı (Sadece pozisyonda değilsek) ---
+    if (
+      lastTradeType === null && // Sadece pozisyonda değilsek AL sinyali ara
+      (now - lastSignalTime >= COOLDOWN_MS) &&
+      currentEMAShort > currentEMALong && // Hızlı EMA yavaş EMA üzerinde
+      currentRSI >= RSI_BUY_LOWER && currentRSI <= RSI_BUY_UPPER && // RSI alım momentumunda
+      close > previousClose + (currentATR * PRICE_CHANGE_MULTIPLIER_BUY) && // Fiyat, önceki mum kapanışından ATR * çarpan kadar artmalı
+      emaDiff > atrEmaDiffThreshold // EMA'lar yeterince ayrılmış (trend gücü)
+    ) {
+        // Tüm bakiye ile alım yapıldığı varsayımı
+        lastPositionAmount = currentCapital; // Pozisyona girerken harcanan miktar
+        lastBuyPrice = close; // Kripto biriminin alış fiyatı
+        positionCostBasis = close * (1 + COMMISSION_RATE); // Gerçek maliyet (alış fiyatı + alım komisyonu)
+
+        // Güncel sermayeden alım komisyonunu düş (simülasyon)
+        currentCapital -= (lastPositionAmount * COMMISSION_RATE); // Sadece alım komisyonu düşülür
+
+        sendTelegramMessage(
+            `📈 AL SİNYALİ!\nFiyat: ${close.toFixed(2)}\nEMA${EMA_SHORT_PERIOD}: ${currentEMAShort.toFixed(2)} | EMA${EMA_LONG_PERIOD}: ${currentEMALong.toFixed(2)}\nRSI(${RSI_PERIOD}): ${currentRSI.toFixed(1)}\nATR(${ATR_PERIOD}): ${currentATR.toFixed(2)}\nGüncel Bakiye: ${currentCapital.toFixed(2)} TL`
+        );
+        lastSignalTime = now;
+        lastTradeType = 'BUY'; // Pozisyonu 'BUY' olarak işaretle
+        lastTradeOrSignalTime = now; // Yeni bir sinyal geldiğinde zamanı güncelle
+        console.log(`✅ AL sinyali gönderildi. Giriş Fiyatı: ${lastBuyPrice.toFixed(2)}, Maliyet Bazı: ${positionCostBasis.toFixed(2)}`);
+    }
+
+    // --- SAT Sinyali Mantığı (Sadece AL pozisyonundaysak) ---
+    // Mevcut AL pozisyonunu kapatma (Take Profit / Stop Loss / Trend Dönüşü)
+    if (lastTradeType === 'BUY') { // Sadece bir AL pozisyonundaysak bu bloğu kontrol et
+        let shouldCloseLongPosition = false;
+        let reason = "Bilinmiyor";
+
+        // Mevcut fiyattan satış komisyonunu düşerek net satış fiyatını hesapla
+        const currentPriceAfterSellFee = close * (1 - COMMISSION_RATE);
+        // Net Kar/Zarar: (Net Satış Fiyatı) - (Pozisyonun Toplam Maliyeti)
+        // positionCostBasis aslında birim başına maliyet, lastPositionAmount ise toplam miktar.
+        // Bu yüzden toplam kar/zararı hesaplarken orantı kurmalıyız.
+        const profitLossPerUnit = currentPriceAfterSellFee - positionCostBasis; // Birim başına kar/zarar
+        const totalProfitLoss = (lastPositionAmount / lastBuyPrice) * profitLossPerUnit; // Toplam pozisyon için kar/zarar
+
+        const netProfitLossPercentage = (totalProfitLoss / lastPositionAmount) * 100; // Toplam bakiye değişim yüzdesi
+
+        // 1. Zarar Kes (Stop-Loss)
+        if (netProfitLossPercentage <= -STOP_LOSS_PERCENTAGE * 100) {
+            shouldCloseLongPosition = true;
+            reason = `Zarar Kes (Net ${netProfitLossPercentage.toFixed(2)}%)`;
+        }
+        // 2. Kar Al veya Trend Dönüşü
+        else if (currentEMAShort < currentEMALong) { // EMA ölüm kesişimi (bearish crossover)
+            if (totalProfitLoss > 0) { // Kârlı ise
+                shouldCloseLongPosition = true;
+                reason = "EMA bearish crossover (Kârlı Çıkış)";
+            } else { // Zarardaysak ve trend dönüyorsa zararı minimize etmek için çık
+                shouldCloseLongPosition = true;
+                reason = "EMA bearish crossover (Zarar Minimize)";
+            }
+        }
+        else if (currentRSI > RSI_SELL_UPPER && close < previousClose) { // RSI aşırı alım bölgesinde ve fiyat düşüşe geçmişse
+            if (totalProfitLoss > 0) { // Sadece kârlı ise bu sinyalle çık
+                shouldCloseLongPosition = true;
+                reason = "RSI aşırı alım dönüşü (Kârlı Çıkış)";
+            }
+        }
+        else if (close < previousClose - (currentATR * PRICE_CHANGE_MULTIPLIER_SELL)) { // Fiyat ATR bazında düşüş yaşamışsa (momentum kaybı)
+            if (totalProfitLoss > 0) { // Sadece kârlı ise bu sinyalle çık
+                shouldCloseLongPosition = true;
+                reason = "Fiyat ATR bazında düşüş (momentum kaybı, Kârlı Çıkış)";
+            }
+        }
+        // Ek Kar Al koşulu: Fiyat yeterince yükseldiyse ve komisyonları aştıysa kar al
+        else if (netProfitLossPercentage >= MIN_PROFIT_TARGET_PERCENTAGE * 100) {
+            shouldCloseLongPosition = true;
+            reason = `Hedef Kara Ulaşıldı (Net ${netProfitLossPercentage.toFixed(2)}%)`;
+        }
+
+
+        if (shouldCloseLongPosition) {
+            // Bakiyeyi güncelle
+            currentCapital += totalProfitLoss; // Mevcut kar/zararı bakiyeye ekle
+
+            const totalPerformancePercentage = ((currentCapital - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
+
+            sendTelegramMessage(
+              `📉 SAT SİNYALİ (Pozisyon Kapatma)!\nSebep: ${reason}\nFiyat: ${close.toFixed(2)}\nNet K/Z: ${netProfitLossPercentage.toFixed(2)}%\n\n🚨 Güncel Bakiye: ${currentCapital.toFixed(2)} TL\n🚨 Toplam Performans: ${totalPerformancePercentage.toFixed(2)}%`
+            );
+            lastSignalTime = now;
+            lastTradeType = null; // Pozisyonu kapatınca nakite geçtik
+            lastTradeOrSignalTime = now; // Yeni bir sinyal geldiğinde zamanı güncelle
+            // Pozisyon değişkenlerini sıfırla
+            lastBuyPrice = null;
+            positionCostBasis = null;
+            lastPositionAmount = 0; // Harcanan miktarı sıfırla
+            console.log('✅ SAT sinyali gönderildi (Long Pozisyon Kapatma)');
+        }
+    }
+
+    const currentStatus = lastTradeType === 'BUY' ? `LONG @${lastBuyPrice ? lastBuyPrice.toFixed(2) : 'N/A'}` : 'NAKİT';
+    let currentNetKzText = '';
+    if (lastTradeType === 'BUY' && positionCostBasis && lastBuyPrice && lastPositionAmount > 0) {
+        const currentPriceAfterSellFee = close * (1 - COMMISSION_RATE);
+        const profitLossPerUnit = currentPriceAfterSellFee - positionCostBasis;
+        const totalProfitLoss = (lastPositionAmount / lastBuyPrice) * profitLossPerUnit;
+        const netProfitLossPercentage = (totalProfitLoss / lastPositionAmount) * 100;
+        currentNetKzText = ` | Net K/Z: ${netProfitLossPercentage.toFixed(2)}%`;
+    }
+
+    console.log(
+      `📊 ${new Date().toLocaleTimeString()} | Fiyat: ${close.toFixed(2)} | EMA${EMA_SHORT_PERIOD}: ${currentEMAShort.toFixed(2)} | EMA${EMA_LONG_PERIOD}: ${currentEMALong.toFixed(2)} | RSI(${RSI_PERIOD}): ${currentRSI.toFixed(1)} | ATR(${ATR_PERIOD}): ${currentATR.toFixed(2)} | EMA Diff: ${emaDiff.toFixed(2)} | Eşik: ${atrEmaDiffThreshold.toFixed(2)} | Durum: ${currentStatus}${currentNetKzText}`
     );
-    lastBuyPrice = close; // AL sinyali verilen fiyatı kaydet
-    lastSignalTime = now;
-    lastTradeType = 'BUY';
-    console.log('✅ AL sinyali gönderildi');
-  }
+  });
 
-  // --- SAT Sinyali Mantığı ---
-  // Koşullar:
-  // 1. Kısa EMA uzun EMA'nın altında (Bearish crossover) VEYA
-  // 2. RSI aşırı alım bölgesine girmiş VEYA
-  // 3. Fiyat, en son AL sinyal fiyatına göre belirli bir oranda düşmüş (stop-loss/kar alma gibi) VEYA
-  // 4. Fiyat bir önceki mum kapanışına göre yeterince düşmüş (volatiliteye göre teyit)
-  // 5. EMA'lar birbirinden yeterince açılmış (trendin gücü)
-  // (Not: Gerçek bir trader, genellikle bir pozisyondayken satış yapar. Burada hem trend dönüşü hem de potansiyel kar al/zarar kes sinyalleri birleşiyor.)
-  if (
-    lastTradeType === 'BUY' && // Sadece bir AL pozisyonundaysak veya son sinyal AL ise SAT sinyali ara
-    (
-        currentEMA10 < currentEMA21 || // Bearish crossover
-        currentRSI > RSI_SELL_UPPER || // Aşırı alım bölgesinden dönüş işareti
-        currentRSI < RSI_SELL_LOWER || // Aşırı satım bölgesine giriş (potansiyel dip, kardan çıkış veya zarar kes)
-        (lastBuyPrice && close < lastBuyPrice * 0.995) || // %0.5 Zarar Kes (Örn: Basit Stop Loss)
-        close < previousClose - (currentATR * PRICE_CHANGE_MULTIPLIER_SELL) // Önceki kapanışa göre ATR tabanlı düşüş
-    ) &&
-    emaDiff > atrEmaDiffThreshold &&
-    lastTradeType !== 'SELL' // Bir SAT sinyali zaten verilmişse tekrar vermemek
-  ) {
-    sendTelegramMessage(
-      `📉 SAT SİNYALİ!\nFiyat: ${close.toFixed(2)}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}\nATR: ${currentATR.toFixed(2)}`
-    );
-    lastSellPrice = close; // SAT sinyali verilen fiyatı kaydet
-    lastSignalTime = now;
-    lastTradeType = 'SELL';
-    console.log('✅ SAT sinyali gönderildi');
-  }
+  ws.on('error', (error) => {
+      console.error('❌ WebSocket hatası:', error);
+  });
 
-  // Konsol çıktısı her mum kapanışında
-  console.log(
-    `📊 ${new Date().toLocaleTimeString()} | Fiyat: ${close.toFixed(2)} | EMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)} | RSI: ${currentRSI.toFixed(1)} | ATR: ${currentATR.toFixed(2)} | EMA Diff: ${emaDiff.toFixed(2)} | Eşit: ${atrEmaDiffThreshold.toFixed(2)}`
-  );
-});
+  ws.on('close', (code, reason) => {
+      console.log(`🔌 WebSocket bağlantısı kapatıldı. Kod: ${code}, Neden: ${reason}`);
+      console.log("🔄 WebSocket yeniden bağlanmaya çalışıyor...");
+      setTimeout(connectWebSocket, 5000);
+  });
+}
 
-// WebSocket hata yönetimi
-ws.on('error', (error) => {
-    console.error('❌ WebSocket hatası:', error);
-    // Burada otomatik yeniden bağlantı mekanizması eklenebilir.
-});
+// Botu başlat
+async function startBot() {
+    await fetchInitialKlineData();
+    connectWebSocket();
 
-ws.on('close', (code, reason) => {
-    console.log(`🔌 WebSocket bağlantısı kapatıldı. Kod: ${code}, Neden: ${reason}`);
-    // Bağlantı koparsa yeniden bağlanmayı deneyin
-    setTimeout(() => {
-        console.log("🔄 WebSocket yeniden bağlanmaya çalışıyor...");
-        new WebSocket(WS_URL);
-    }, 5000); // 5 saniye sonra yeniden deneme
-});
+    // --- "TUT" mesajı zamanlayıcısını başlat ---
+    setInterval(() => {
+        const now = Date.now();
+        const secondsSinceLastTradeOrSignal = ((now - lastTradeOrSignalTime) / 1000).toFixed(0);
+        console.log(`TUT kontrolü: ${secondsSinceLastTradeOrSignal} saniye geçti. lastTradeType: ${lastTradeType || 'NAKİT'}`);
+        if (now - lastTradeOrSignalTime >= HOLD_MESSAGE_INTERVAL_MS) {
+            let message = '';
+            const currentPrice = closeHistory.at(-1);
+
+            if (lastTradeType === 'BUY') { // Pozisyonda ise
+                // Kar/Zarar hesaplaması: Net satış fiyatı - Maliyet Bazı
+                const currentPriceAfterSellFee = currentPrice * (1 - COMMISSION_RATE);
+                const profitLossPerUnit = currentPriceAfterSellFee - positionCostBasis; // Birim başına kar/zarar
+                const totalProfitLoss = (lastPositionAmount / lastBuyPrice) * profitLossPerUnit; // Toplam pozisyon için kar/zarar
+
+                const netProfitLossPercentage = (totalProfitLoss / lastPositionAmount) * 100;
+
+                message = `🟢 TUT (AL Pozisyonunda)! Fiyat: ${currentPrice.toFixed(2)} | Giriş Maliyet: ${positionCostBasis.toFixed(2)} | Net K/Z: ${netProfitLossPercentage.toFixed(2)}%`;
+            } else { // lastTradeType === null (Pozisyonda değilse)
+                const totalPerformancePercentage = ((currentCapital - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
+                message = `🧘 TUT (NAKİT)! Yeni AL sinyali bekleniyor...\nGüncel Bakiye: ${currentCapital.toFixed(2)} TL\nToplam Performans: ${totalPerformancePercentage.toFixed(2)}%`;
+            }
+            sendTelegramMessage(message);
+            lastTradeOrSignalTime = now; // TUT mesajı gönderildiğinde zamanlayıcıyı sıfırla
+            console.log(`✅ "${message}" mesajı gönderildi.`);
+        }
+    }, HOLD_MESSAGE_INTERVAL_MS);
+}
+
+startBot();
