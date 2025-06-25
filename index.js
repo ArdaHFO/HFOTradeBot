@@ -3,12 +3,11 @@ const { EMA, RSI } = require('technicalindicators');
 const { sendTelegramMessage } = require('./notify');
 require('dotenv').config();
 
-// Başlangıç referans fiyat ve fiyat geçmişi
 let lastRefPrice = null;
 let lastSignalTime = 0;
 const priceHistory = [];
 
-const cooldownMS = 0.5 * 60 * 1000; // 1 dakika
+const cooldownMS = 0.1 * 60 * 1000; // 30 saniye cooldown
 const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
 
 ws.on('open', () => {
@@ -17,7 +16,12 @@ ws.on('open', () => {
 
 ws.on('message', (data) => {
   const parsed = JSON.parse(data);
-  const price = parseFloat(parsed.c);
+  const candle = parsed.k;
+
+  // Sadece mum kapanışında işlem yap
+  if (!candle.x) return;
+
+  const price = parseFloat(candle.c);
   if (isNaN(price)) return;
 
   priceHistory.push(price);
@@ -43,46 +47,37 @@ ws.on('message', (data) => {
   if (!currentEMA10 || !currentEMA21 || !currentRSI) return;
   const emaDiff = Math.abs(currentEMA10 - currentEMA21);
 
-  // Sadece cooldown süresi dolduysa sinyal gönder
-  let signalSent = false;
+  if (now - lastSignalTime < cooldownMS) return;
 
   // AL sinyali
   if (
-    currentEMA10 > currentEMA21 &&        // trend pozitif
-    currentRSI > 40 && currentRSI < 70 && // RSI ne dipte ne zirvede
-    price > lastRefPrice * 1.003 &&       // %0.3 yükselmiş
-    emaDiff > 1                           // momentum var
-    
+    currentEMA10 > currentEMA21 &&
+    currentRSI > 40 && currentRSI < 70 &&
+    price > lastRefPrice * 1.003 &&
+    emaDiff > 1
   ) {
-    if (now - lastSignalTime >= cooldownMS) {
-      sendTelegramMessage(
-        `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
-      );
-      lastRefPrice = price;
-      lastSignalTime = now;
-      signalSent = true;
-    }
+    sendTelegramMessage(
+      `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
+    );
+    // Sadece sinyal zamanını güncelle, referans fiyatı AL için güncelleme
+    lastSignalTime = now;
+    console.log('✅ AL sinyali gönderildi');
   }
 
   // SAT sinyali
   if (
     (currentEMA10 < currentEMA21 ||
       currentRSI > 75 ||
-      price < lastRefPrice * 0.95) &&
+      price < lastRefPrice * 0.995) &&
     emaDiff > 1
   ) {
-    if (now - lastSignalTime >= cooldownMS) {
-      sendTelegramMessage(
-        `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
-      );
-      lastRefPrice = price;
-      lastSignalTime = now;
-      signalSent = true;
-    }
-  }
-
-  if (!signalSent) {
-    // console.log('Cooldown aktif veya sinyal koşulları sağlanmadı.');
+    sendTelegramMessage(
+      `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
+    );
+    // SAT'ta referans fiyat ve sinyal zamanı güncellenir
+    lastRefPrice = price;
+    lastSignalTime = now;
+    console.log('✅ SAT sinyali gönderildi');
   }
 
   console.log(
