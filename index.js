@@ -9,7 +9,7 @@ let lastSignalTime = 0;
 const priceHistory = [];
 
 const cooldownMS = 0.5 * 60 * 1000; // 1 dakika
-const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
+const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
 
 ws.on('open', () => {
   console.log("📡 Binance WebSocket bağlantısı kuruldu.");
@@ -49,7 +49,7 @@ ws.on('message', (data) => {
   // AL sinyali
   if (
     currentEMA10 > currentEMA21 &&        // trend pozitif
-    currentRSI > 45 && currentRSI < 65 && // RSI ne dipte ne zirvede
+    currentRSI > 40 && currentRSI < 70 && // RSI ne dipte ne zirvede
     price > lastRefPrice * 1.003 &&       // %0.3 yükselmiş
     emaDiff > 1                           // momentum var
     
