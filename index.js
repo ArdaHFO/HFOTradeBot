@@ -48,10 +48,11 @@ ws.on('message', (data) => {
 
   // AL sinyali
   if (
-    currentEMA10 > currentEMA21 &&
-    currentRSI < 65 &&
-    price > lastRefPrice * 1.01 &&
-    emaDiff > 2
+    currentEMA10 > currentEMA21 &&        // trend pozitif
+    currentRSI > 45 && currentRSI < 65 && // RSI ne dipte ne zirvede
+    price > lastRefPrice * 1.003 &&       // %0.3 yükselmiş
+    emaDiff > 1                           // momentum var
+    
   ) {
     if (now - lastSignalTime >= cooldownMS) {
       sendTelegramMessage(
