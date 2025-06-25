@@ -1,0 +1,17 @@
+{
+  "name": "tradebot",
+  "version": "1.0.0",
+  "description": "Binance BTCUSDT fiyatını izleyip Telegram'a sinyal gönderen bot.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5",
+    "npm": "^11.4.2",
+    "start": "^5.1.0",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.16.0"
+  }
+}
