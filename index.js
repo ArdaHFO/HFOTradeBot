@@ -298,7 +298,7 @@ async function startBot() {
                 message = `🟢 TUT (AL Pozisyonunda)! Fiyat: ${currentPrice.toFixed(2)} | Giriş Maliyet: ${positionCostBasis.toFixed(2)} | Net K/Z: ${netProfitLossPercentage.toFixed(2)}%`;
             } else { // lastTradeType === null (Pozisyonda değilse)
                 const totalPerformancePercentage = ((currentCapital - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100;
-                message = `🧘 TUT (NAKİT)! Yeni AL sinyali bekleniyor...\nGüncel Bakiye: ${currentCapital.toFixed(2)} TL\nToplam Performans: ${totalPerformancePercentage.toFixed(2)}%`;
+                message = `😏 TUT (NAKİT)! Yeni AL sinyali bekleniyor...\nGüncel Bakiye: ${currentCapital.toFixed(2)} TL\nToplam Performans: ${totalPerformancePercentage.toFixed(2)}%`;
             }
             sendTelegramMessage(message);
             lastTradeOrSignalTime = now; // TUT mesajı gönderildiğinde zamanlayıcıyı sıfırla
