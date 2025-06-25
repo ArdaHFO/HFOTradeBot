@@ -69,7 +69,7 @@ ws.on('message', (data) => {
     (currentEMA10 < currentEMA21 ||
       currentRSI > 75 ||
       price < lastRefPrice * 0.95) &&
-    emaDiff > 10
+    emaDiff > 1
   ) {
     if (now - lastSignalTime >= cooldownMS) {
       sendTelegramMessage(
