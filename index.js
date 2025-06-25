@@ -8,7 +8,7 @@ let lastRefPrice = null;
 let lastSignalTime = 0;
 const priceHistory = [];
 
-const cooldownMS = 1 * 60 * 1000; // 1 dakika
+const cooldownMS = 0.5 * 60 * 1000; // 1 dakika
 const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
 
 ws.on('open', () => {
