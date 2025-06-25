@@ -5,8 +5,10 @@ require('dotenv').config();
 
 // Başlangıç referans fiyat ve fiyat geçmişi
 let lastRefPrice = null;
+let lastSignalTime = 0;
 const priceHistory = [];
 
+const cooldownMS = 1 * 60 * 1000; // 30 dakika
 const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
 
 ws.on('open', () => {
@@ -18,7 +20,6 @@ ws.on('message', (data) => {
   const price = parseFloat(parsed.c);
   if (isNaN(price)) return;
 
-  // Fiyat geçmişini güncelle
   priceHistory.push(price);
   if (priceHistory.length > 100) priceHistory.shift();
 
@@ -28,7 +29,6 @@ ws.on('message', (data) => {
     return;
   }
 
-  // EMA & RSI hesaplamak için yeterli veri yoksa çık
   if (priceHistory.length < 21) return;
 
   const ema10 = EMA.calculate({ period: 10, values: priceHistory });
@@ -38,31 +38,39 @@ ws.on('message', (data) => {
   const currentEMA10 = ema10.at(-1);
   const currentEMA21 = ema21.at(-1);
   const currentRSI = rsi.at(-1);
+  const now = Date.now();
 
   if (!currentEMA10 || !currentEMA21 || !currentRSI) return;
+  if (now - lastSignalTime < cooldownMS) return;
+
+  const emaDiff = Math.abs(currentEMA10 - currentEMA21);
 
   // AL sinyali
   if (
     currentEMA10 > currentEMA21 &&
     currentRSI < 50 &&
-    price > lastRefPrice * 1.03 //3%lük değişim
+    price > lastRefPrice * 1.03 &&
+    emaDiff > 10
   ) {
     sendTelegramMessage(
       `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
     );
     lastRefPrice = price;
+    lastSignalTime = now;
   }
 
   // SAT sinyali
   if (
-    currentEMA10 < currentEMA21 ||
-    currentRSI > 75 ||
-    price < lastRefPrice * 0.98
+    (currentEMA10 < currentEMA21 ||
+     currentRSI > 75 ||
+     price < lastRefPrice * 0.95) &&
+    emaDiff > 10
   ) {
     sendTelegramMessage(
       `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
     );
     lastRefPrice = price;
+    lastSignalTime = now;
   }
 
   console.log(
