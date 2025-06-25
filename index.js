@@ -59,13 +59,12 @@ ws.on('message', (data) => {
     sendTelegramMessage(
       `📈 AL sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
     );
-    // Sadece sinyal zamanını güncelle, referans fiyatı AL için güncelleme
     lastSignalTime = now;
     console.log('✅ AL sinyali gönderildi');
   }
 
   // SAT sinyali
-  if (
+  else if (
     (currentEMA10 < currentEMA21 ||
       currentRSI > 75 ||
       price < lastRefPrice * 0.995) &&
@@ -74,8 +73,7 @@ ws.on('message', (data) => {
     sendTelegramMessage(
       `📉 SAT sinyali!\nFiyat: ${price}\nEMA10: ${currentEMA10.toFixed(2)} | EMA21: ${currentEMA21.toFixed(2)}\nRSI: ${currentRSI.toFixed(1)}`
     );
-    // SAT'ta referans fiyat ve sinyal zamanı güncellenir
-    lastRefPrice = price;
+    lastRefPrice = price;  // SAT'ta referans fiyat güncelleniyor
     lastSignalTime = now;
     console.log('✅ SAT sinyali gönderildi');
   }
